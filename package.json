@@ -1,0 +1,12 @@
+{
+  "name": "shopify-gold-price-updater",
+  "version": "1.0.0",
+  "main": "shopify-price-updater.js",
+  "scripts": {
+    "start": "node shopify-price-updater.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "socket.io-client": "^4.8.3"
+  }
+}
