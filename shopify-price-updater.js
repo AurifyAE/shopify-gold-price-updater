@@ -77,6 +77,7 @@ let variantCache  = new Map();   // variantId → product + metafield data
 let lastPrice     = new Map();   // variantId → last price sent to Shopify
 let catalogReady  = false;
 let lastFetchTime = null;
+let closingPriceSaved = false;
 
 // ── SHOPIFY API BASE ─────────────────────────────────────────────
 const SHOPIFY_BASE = `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}`;
@@ -311,6 +312,9 @@ if (!catalogReady || variantCache.size === 0) {
   return;
 }
 
+// Market reopened — allow closing price to be saved again next close
+closingPriceSaved = false;
+
 let updateCount = 0;
 
 for (const [variantId, meta] of variantCache) {
@@ -354,9 +358,25 @@ socket.on('connect', () => {
 socket.on('market-data', (data) => {
   const symbol = data && data.symbol ? data.symbol.toUpperCase() : null;
   if (symbol !== 'GOLD') return;
-  if (data.marketStatus !== 'TRADEABLE') return;
+
   const goldRate24k = data.offer / CONFIG.troyOzToGram;
-  handleGoldRate(goldRate24k);
+
+  if (data.marketStatus === 'TRADEABLE') {
+    // Normal live tick
+    handleGoldRate(goldRate24k);
+
+  } else if (
+    data.marketStatus === 'CLOSED' ||
+    data.marketStatus === 'WEEKEND'
+  ) {
+    // Market just closed — fire one final price update with closing rate
+    // Only runs once because after this, no more ticks come in
+    if (!closingPriceSaved) {
+      closingPriceSaved = true;
+      console.log(`[PriceUpdater] 🔔 Market ${data.marketStatus} — saving closing price AED ${goldRate24k.toFixed(4)}/g`);
+      handleGoldRate(goldRate24k);
+    }
+  }
 });
 
 socket.on('disconnect', (reason) => {
