@@ -84,63 +84,75 @@ const SHOPIFY_BASE = `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyV
 // ── FETCH ALL METAFIELDS (BULK) ──────────────────────────────────
 // Fetches ALL product metafields in as few API calls as possible.
 // Returns Map of productId → { key: value }
-async function fetchAllMetafields() {
-console.log('[Catalog] Fetching all product metafields (bulk)...');
+async function fetchAllMetafields(productIds) {
+  console.log(`[Catalog] Fetching metafields for ${productIds.length} products...`);
 
-const metaMap = new Map();
-let   url     = `${SHOPIFY_BASE}/metafields.json?limit=250&namespace=${CONFIG.metafieldNamespace}&owner_resource=product`;
-let   page    = 0;
+  const metaMap = new Map();
+  const BATCH   = 5; // max concurrent requests — stay under rate limit
 
-while (url) {
-  page++;
-  const res  = await shopifyGet(url);
-  const data = await res.json();
+  for (let i = 0; i < productIds.length; i += BATCH) {
+    const batch = productIds.slice(i, i + BATCH);
 
-  for (const field of (data.metafields || [])) {
-    const pid = field.owner_id;
-    if (!metaMap.has(pid)) metaMap.set(pid, {});
-    metaMap.get(pid)[field.key] = field.value;
+    await Promise.all(batch.map(async (pid) => {
+      try {
+        const url = `${SHOPIFY_BASE}/products/${pid}/metafields.json?namespace=${CONFIG.metafieldNamespace}&limit=250`;
+        const res  = await shopifyGet(url);
+        const data = await res.json();
+
+        const fields = {};
+        for (const field of (data.metafields || [])) {
+          fields[field.key] = field.value;
+        }
+        metaMap.set(pid, fields);
+      } catch (err) {
+        console.warn(`[Catalog] ⚠️  Metafields failed for product ${pid}:`, err.message);
+      }
+    }));
+
+    if (i + BATCH < productIds.length) await sleep(500); // respect rate limit
   }
 
-  // Shopify pagination
-  const link      = res.headers.get('Link') || '';
-  const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
-  url             = nextMatch ? nextMatch[1] : null;
-  if (url) await sleep(300);
-}
-
-console.log(`[Catalog] Got metafields for ${metaMap.size} products (${page} page(s))`);
-return metaMap;
+  console.log(`[Catalog] Got metafields for ${metaMap.size} products`);
+  return metaMap;
 }
 
 // ── FETCH CATALOG ────────────────────────────────────────────────
 // Fetches all products, matches with metafields, builds variant cache.
 async function fetchCatalog() {
-console.log('[Catalog] 🔄 Building product catalog...');
+  console.log('[Catalog] 🔄 Building product catalog...');
 
-const newCache = new Map();
-let totalProds = 0;
-let totalVars  = 0;
+  const newCache = new Map();
+  let totalProds = 0;
+  let totalVars  = 0;
 
-try {
-  // Step 1 — Fetch all metafields in bulk (very few API calls)
-  const metaMap = await fetchAllMetafields();
+  try {
+    // Step 1 — Fetch all products (paginated) to get IDs + variants
+    const allProducts = [];
+    let url  = `${SHOPIFY_BASE}/products.json?limit=250&fields=id,title,variants`;
 
-  // Step 2 — Fetch all products (paginated)
-  let url  = `${SHOPIFY_BASE}/products.json?limit=250&fields=id,title,variants`;
-  let page = 0;
+    while (url) {
+      const res  = await shopifyGet(url);
+      const data = await res.json();
+      allProducts.push(...(data.products || []));
 
-  while (url) {
-    page++;
-    const res  = await shopifyGet(url);
-    const data = await res.json();
+      const link      = res.headers.get('Link') || '';
+      const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
+      url             = nextMatch ? nextMatch[1] : null;
+      if (url) await sleep(300);
+    }
 
-    for (const product of (data.products || [])) {
+    console.log(`[Catalog] Found ${allProducts.length} total products`);
+
+    // Step 2 — Fetch metafields for all products (batched per-product)
+    const productIds = allProducts.map(p => p.id);
+    const metaMap    = await fetchAllMetafields(productIds);
+
+    // Step 3 — Build variant cache
+    for (const product of allProducts) {
       const meta      = metaMap.get(product.id) || {};
       const goldGrams = parseFloat(meta[CONFIG.metafieldKeys.goldGrams] || 0);
 
-      // Skip non-gold products
-      if (!goldGrams) continue;
+      if (!goldGrams) continue; // skip non-gold products
 
       totalProds++;
 
@@ -155,32 +167,22 @@ try {
         vatExempt:  meta[CONFIG.metafieldKeys.vatExempt] === 'true',
       };
 
-      // Add all sizes/variants of this product
       for (const variant of product.variants) {
         newCache.set(variant.id, { ...variantMeta, variantId: variant.id });
         totalVars++;
       }
     }
 
-    // Pagination
-    const link      = res.headers.get('Link') || '';
-    const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
-    url             = nextMatch ? nextMatch[1] : null;
-    if (url) await sleep(300);
+    variantCache  = newCache;
+    catalogReady  = true;
+    lastFetchTime = new Date();
+
+    console.log(`[Catalog] ✅ ${totalProds} gold products → ${totalVars} variants loaded`);
+    logCatalogSummary();
+
+  } catch (err) {
+    console.error('[Catalog] ❌ Fetch failed:', err.message);
   }
-
-  // Swap cache atomically
-  variantCache  = newCache;
-  catalogReady  = true;
-  lastFetchTime = new Date();
-
-  console.log(`[Catalog] ✅ ${totalProds} gold products → ${totalVars} variants loaded`);
-  logCatalogSummary();
-
-} catch (err) {
-  console.error('[Catalog] ❌ Fetch failed:', err.message);
-  // Keep existing cache — prices continue updating with last known data
-}
 }
 
 // Print a clean summary of loaded products
