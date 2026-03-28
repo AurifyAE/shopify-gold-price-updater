@@ -81,43 +81,9 @@ let lastFetchTime = null;
 // ── SHOPIFY API BASE ─────────────────────────────────────────────
 const SHOPIFY_BASE = `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}`;
 
-// ── FETCH ALL METAFIELDS (BULK) ──────────────────────────────────
-// Fetches ALL product metafields in as few API calls as possible.
-// Returns Map of productId → { key: value }
-async function fetchAllMetafields(productIds) {
-  console.log(`[Catalog] Fetching metafields for ${productIds.length} products...`);
-
-  const metaMap = new Map();
-  const BATCH   = 5; // max concurrent requests — stay under rate limit
-
-  for (let i = 0; i < productIds.length; i += BATCH) {
-    const batch = productIds.slice(i, i + BATCH);
-
-    await Promise.all(batch.map(async (pid) => {
-      try {
-        const url = `${SHOPIFY_BASE}/products/${pid}/metafields.json?namespace=${CONFIG.metafieldNamespace}&limit=250`;
-        const res  = await shopifyGet(url);
-        const data = await res.json();
-
-        const fields = {};
-        for (const field of (data.metafields || [])) {
-          fields[field.key] = field.value;
-        }
-        metaMap.set(pid, fields);
-      } catch (err) {
-        console.warn(`[Catalog] ⚠️  Metafields failed for product ${pid}:`, err.message);
-      }
-    }));
-
-    if (i + BATCH < productIds.length) await sleep(500); // respect rate limit
-  }
-
-  console.log(`[Catalog] Got metafields for ${metaMap.size} products`);
-  return metaMap;
-}
-
-// ── FETCH CATALOG ────────────────────────────────────────────────
-// Fetches all products, matches with metafields, builds variant cache.
+// ── GRAPHQL BULK FETCH ───────────────────────────────────────────
+// One single GraphQL call fetches all products + metafields.
+// No per-product loops, no rate limiting, handles 244 products instantly.
 async function fetchCatalog() {
   console.log('[Catalog] 🔄 Building product catalog...');
 
@@ -126,51 +92,99 @@ async function fetchCatalog() {
   let totalVars  = 0;
 
   try {
-    // Step 1 — Fetch all products (paginated) to get IDs + variants
-    const allProducts = [];
-    let url  = `${SHOPIFY_BASE}/products.json?limit=250&fields=id,title,variants`;
+    let hasNextPage = true;
+    let cursor      = null;
 
-    while (url) {
-      const res  = await shopifyGet(url);
-      const data = await res.json();
-      allProducts.push(...(data.products || []));
+    while (hasNextPage) {
+      const afterClause = cursor ? `, after: "${cursor}"` : '';
 
-      const link      = res.headers.get('Link') || '';
-      const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
-      url             = nextMatch ? nextMatch[1] : null;
-      if (url) await sleep(300);
-    }
+      const query = `{
+        products(first: 50${afterClause}) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              id
+              title
+              variants(first: 100) {
+                edges { node { id } }
+              }
+              metafields(first: 20, namespace: "${CONFIG.metafieldNamespace}") {
+                edges {
+                  node { key value }
+                }
+              }
+            }
+          }
+        }
+      }`;
 
-    console.log(`[Catalog] Found ${allProducts.length} total products`);
+      const res  = await fetch(`https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}/graphql.json`, {
+        method:  'POST',
+        headers: {
+          'Content-Type':           'application/json',
+          'X-Shopify-Access-Token': CONFIG.shopifyToken,
+        },
+        body: JSON.stringify({ query }),
+      });
 
-    // Step 2 — Fetch metafields for all products (batched per-product)
-    const productIds = allProducts.map(p => p.id);
-    const metaMap    = await fetchAllMetafields(productIds);
-
-    // Step 3 — Build variant cache
-    for (const product of allProducts) {
-      const meta      = metaMap.get(product.id) || {};
-      const goldGrams = parseFloat(meta[CONFIG.metafieldKeys.goldGrams] || 0);
-
-      if (!goldGrams) continue; // skip non-gold products
-
-      totalProds++;
-
-      const variantMeta = {
-        productTitle: product.title,
-        productId:    product.id,
-        goldGrams,
-        diamondCt:  parseFloat(meta[CONFIG.metafieldKeys.diamondCt] || 0),
-        stoneCost:  parseFloat(meta[CONFIG.metafieldKeys.stoneCost]  || 0),
-        makingPct:  parseFloat(meta[CONFIG.metafieldKeys.makingPct]  || 12),
-        karat:      meta[CONFIG.metafieldKeys.karat]                 || '22K',
-        vatExempt:  meta[CONFIG.metafieldKeys.vatExempt] === 'true',
-      };
-
-      for (const variant of product.variants) {
-        newCache.set(variant.id, { ...variantMeta, variantId: variant.id });
-        totalVars++;
+      if (res.status === 429) {
+        const wait = parseFloat(res.headers.get('Retry-After') || '2') * 1000;
+        console.warn(`[Shopify] ⏳ Rate limited — waiting ${wait}ms`);
+        await sleep(wait);
+        continue;
       }
+
+      if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
+
+      const json     = await res.json();
+      const products = json.data?.products;
+
+      if (!products) {
+        console.error('[Catalog] ❌ GraphQL error:', JSON.stringify(json.errors));
+        break;
+      }
+
+      for (const edge of products.edges) {
+        const product = edge.node;
+
+        // Parse metafields into a flat key→value map
+        const meta = {};
+        for (const mEdge of (product.metafields?.edges || [])) {
+          meta[mEdge.node.key] = mEdge.node.value;
+        }
+
+        const goldGrams = parseFloat(meta[CONFIG.metafieldKeys.goldGrams] || 0);
+        if (!goldGrams) continue; // skip non-gold products
+
+        totalProds++;
+
+        // Shopify GraphQL returns gid://shopify/Product/123 — extract numeric ID
+        const numericProductId = parseInt(product.id.split('/').pop());
+
+        const variantMeta = {
+          productTitle: product.title,
+          productId:    numericProductId,
+          goldGrams,
+          diamondCt:  parseFloat(meta[CONFIG.metafieldKeys.diamondCt] || 0),
+          stoneCost:  parseFloat(meta[CONFIG.metafieldKeys.stoneCost]  || 0),
+          makingPct:  parseFloat(meta[CONFIG.metafieldKeys.makingPct]  || 12),
+          karat:      meta[CONFIG.metafieldKeys.karat]                 || '22K',
+          vatExempt:  meta[CONFIG.metafieldKeys.vatExempt] === 'true',
+        };
+
+        for (const vEdge of (product.variants?.edges || [])) {
+          // Extract numeric variant ID from gid://shopify/ProductVariant/456
+          const variantId = parseInt(vEdge.node.id.split('/').pop());
+          newCache.set(variantId, { ...variantMeta, variantId });
+          totalVars++;
+        }
+      }
+
+      hasNextPage = products.pageInfo.hasNextPage;
+      cursor      = products.pageInfo.endCursor;
+
+      // Small pause between pages — GraphQL costs are higher per call
+      if (hasNextPage) await sleep(200);
     }
 
     variantCache  = newCache;
