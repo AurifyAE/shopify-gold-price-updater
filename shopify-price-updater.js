@@ -281,6 +281,20 @@ async function fetchCatalog() {
         break;
       }
 
+      // ── Debug: log raw metafields for first product on first page ──
+      // This lets you verify namespace, key names, and API token scope.
+      // Remove or disable after confirming catalog loads correctly.
+      if (!cursor && products.edges.length > 0) {
+        const firstProd = products.edges[0].node;
+        const rawMeta = (firstProd.metafields?.edges || []).map(e => e.node);
+        console.log(`[Catalog] 🔍 First product: "${firstProd.title}" — metafields returned: ${rawMeta.length}`);
+        if (rawMeta.length === 0) {
+          console.log(`[Catalog] 🔍 No metafields found. Check: namespace='${CONFIG.metafieldNamespace}', key='${CONFIG.metafieldKeys.goldGrams}', token has read_products scope`);
+        } else {
+          console.log(`[Catalog] 🔍 Raw metafields: ${JSON.stringify(rawMeta)}`);
+        }
+      }
+
       for (const edge of products.edges) {
         const product = edge.node;
 
@@ -619,6 +633,85 @@ function startWebhookServer() {
       return;
     }
 
+    // ── GET /debug — raw metafield inspection ─────────────────
+    // Fetches first 3 products from Shopify and returns their raw
+    // metafields so you can verify namespace, key names, and values.
+    // Use this when catalog shows 0 gold products.
+    // Example: GET https://your-url.railway.app/debug
+    if (req.url === '/debug' && req.method === 'GET') {
+      try {
+        const query = `{
+          products(first: 3) {
+            edges {
+              node {
+                id
+                title
+                metafields(first: 20, namespace: "${CONFIG.metafieldNamespace}") {
+                  edges { node { namespace key value type } }
+                }
+              }
+            }
+          }
+        }`;
+
+        const r = await fetch(
+          `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}/graphql.json`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Shopify-Access-Token': CONFIG.shopifyToken,
+            },
+            body: JSON.stringify({ query }),
+          }
+        );
+
+        const json = await r.json();
+
+        // Also fetch without namespace filter to show ALL metafields on first product
+        const queryAll = `{
+          products(first: 1) {
+            edges {
+              node {
+                title
+                metafields(first: 30) {
+                  edges { node { namespace key value type } }
+                }
+              }
+            }
+          }
+        }`;
+
+        const rAll = await fetch(
+          `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}/graphql.json`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Shopify-Access-Token': CONFIG.shopifyToken,
+            },
+            body: JSON.stringify({ query: queryAll }),
+          }
+        );
+        const jsonAll = await rAll.json();
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          hint: `Namespace filter used: '${CONFIG.metafieldNamespace}', goldGrams key: '${CONFIG.metafieldKeys.goldGrams}'`,
+          filteredByNamespace: json.data?.products?.edges?.map(e => ({
+            title: e.node.title,
+            metafields: e.node.metafields?.edges?.map(m => m.node),
+          })),
+          allMetafieldsFirstProduct: jsonAll.data?.products?.edges?.[0]?.node,
+          graphqlErrors: json.errors || jsonAll.errors || null,
+        }, null, 2));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     // ── POST /rates — update DJG rates from admin platform ────
     // Updates this server's CONFIG.djgRetailRates and immediately
     // reprices all jewellery variants in Shopify.
@@ -703,6 +796,7 @@ function startWebhookServer() {
     console.log(`[Server] Catalog sync: POST /refresh`);
     console.log(`[Server] Read rates:   GET  /rates`);
     console.log(`[Server] Update rates: POST /rates  (Authorization: Bearer <ADMIN_SECRET>)`);
+    console.log(`[Server] Debug:        GET  /debug  ← use if catalog shows 0 products`);
   });
 
   return server;
