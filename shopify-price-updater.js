@@ -98,6 +98,7 @@ const CONFIG = {
 
   // ── Metafield config ──────────────────────────────────────────
   // Must match Shopify metafield setup in Step 1 of the setup guide.
+  metafieldNamespace: 'custom',
 
   metafieldKeys: {
     goldGrams: 'gold_grams',
