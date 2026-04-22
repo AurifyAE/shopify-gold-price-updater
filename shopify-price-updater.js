@@ -27,6 +27,12 @@
  *   vat        = goldCost × vatRate                 ← 0 if vatExempt
  *   total      = goldCost + vat
  *
+ * REQUIREMENTS:
+ *   Node.js >= 18  (native fetch used throughout)
+ *   Add  "engines": { "node": ">=18" }  to package.json so Railway
+ *   selects the correct runtime. On older Node, add node-fetch:
+ *     const fetch = require('node-fetch');
+ *
  * USAGE — standalone:
  *   node shopify-price-updater.js
  *
@@ -38,12 +44,26 @@
  *   POST /rates updates CONFIG.djgRetailRates on THIS server and
  *   triggers a Shopify variant reprice immediately.
  *   gold-rate.js in the browser has its OWN hardcoded djgRetailRates.
- *   To keep the browser in sync, gold-rate.js should fetch GET /rates
- *   at startup — see the note in gold-rate.js Block 1.
+ *   To keep the browser in sync, gold-rate.js fetches GET /rates
+ *   at startup and overwrites its CONFIG.djgRetailRates.
  * ============================================================
  */
 
 'use strict';
+
+// ── FIX: Node version guard ────────────────────────────────────────
+// Native fetch is only available in Node 18+. Fail fast with a clear
+// message rather than crashing later with "fetch is not defined".
+const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
+if (nodeMajor < 18) {
+  console.error(
+    '[StartupError] Node.js 18 or higher is required (native fetch).\n' +
+    `  Current version: ${process.versions.node}\n` +
+    '  Fix: set "engines": { "node": ">=18" } in package.json and redeploy,\n' +
+    '  or install node-fetch and add: const fetch = require(\'node-fetch\');'
+  );
+  process.exit(1);
+}
 
 require('dotenv').config();
 const http = require('http');
@@ -94,7 +114,7 @@ const CONFIG = {
   troyOzToGram: 31.1035,
   usdToAed: 3.674,
   diamondRate: 18000,   // AED per carat
-  vatRate: 0.05,    // UAE 5% | KSA: 0.15 | Qatar/Kuwait: 0
+  vatRate: 0.05,        // UAE 5% | KSA: 0.15 | Qatar/Kuwait: 0
 
   // ── Metafield config ──────────────────────────────────────────
   // Must match Shopify metafield setup in Step 1 of the setup guide.
@@ -108,7 +128,7 @@ const CONFIG = {
     karat: 'gold_karat',
     vatExempt: 'vat_exempt',
     isBullion: 'is_bullion',  // True/False metafield — true for bullion products
-    purity: 'purity',      // e.g. '999.9' — required for bullion products
+    purity: 'purity',         // e.g. '999.9' — required for bullion products
   },
 
   // Only push to Shopify if price changed by more than this %
@@ -124,18 +144,33 @@ const CONFIG = {
   maxCallsPerSecond: 2,
   maxRetries: 3,
 
-  // Admin API auth for POST /rates endpoint
+  // Admin API auth for POST /rates endpoint.
+  // REQUIRED in production — set ADMIN_SECRET in Railway environment variables.
   adminSecret: process.env.ADMIN_SECRET || '',
+
+  // CORS origin for the admin platform.
+  // FIX: Set ADMIN_ORIGIN in Railway env vars to your exact admin URL
+  // (e.g. https://your-admin.vercel.app). Defaults to '*' only for local dev.
+  // With '*', any origin can attempt requests against POST /rates.
+  adminOrigin: process.env.ADMIN_ORIGIN || '*',
 };
+
+// ── Warn loudly if security-critical env vars are missing ─────────
+if (!CONFIG.adminSecret) {
+  console.warn('[Config] ⚠️  ADMIN_SECRET is not set — POST /rates is unprotected. Set it in Railway env vars.');
+}
+if (CONFIG.adminOrigin === '*') {
+  console.warn('[Config] ⚠️  ADMIN_ORIGIN is not set — CORS allows all origins. Set it to your admin platform URL in Railway env vars.');
+}
 
 // ── STATE ──────────────────────────────────────────────────────────
 let variantCache = new Map(); // variantId → product + metafield data
-let lastPrice = new Map(); // variantId → last price pushed to Shopify
+let lastPrice = new Map();    // variantId → last price pushed to Shopify
 let catalogReady = false;
 let lastFetchTime = null;
 let closingPriceSaved = false;
-let currentBid = null;  // latest USD/oz from socket (jewellery uses DJG rates, bullion uses this)
-let currentOfferUsd = null;  // latest USD/oz offer from socket — used for bullion calculation
+let currentBid = null;         // latest USD/oz bid from socket
+let currentOfferUsd = null;    // latest USD/oz offer from socket — used for bullion calculation
 
 // ── SHOPIFY API BASE ───────────────────────────────────────────────
 const SHOPIFY_BASE = `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}`;
@@ -180,10 +215,13 @@ function calculateJewellery(meta) {
 // ============================================================
 // BULLION PRICE CALCULATION
 // Mirrors gold-rate.js calculateBullion() — uses live socket price.
-// Returns null if socket price not yet available.
+// Returns null if socket price not yet available (cold start guard).
 // ============================================================
 function calculateBullion(meta) {
-  if (!currentOfferUsd) return null;  // wait for socket tick
+  // FIX: Guard is intentional — bullion variants are skipped until the first
+  // socket tick arrives. repriceAll() logs these skips so they are visible
+  // in Railway logs. Jewellery pricing is unaffected and proceeds normally.
+  if (!currentOfferUsd) return null;
 
   const fineness = CONFIG.bullionPurity[meta.purity];
   if (!fineness) {
@@ -447,7 +485,15 @@ async function processQueue() {
 //   2. Market closes — saves closing price once
 //   3. POST /rates — DJG rates updated — reprices jewellery only
 //
-// Bullion variants are skipped if socket price not yet available.
+// Bullion variants are skipped (logged) if socket price not yet available.
+//
+// FIX: Concurrent POST /rates + socket tick note —
+//   When POST /rates fires repriceAll({ jewelleryOnly: true }), a concurrent
+//   socket tick may also call repriceAll() for bullion. These two calls do
+//   not interfere: jewelleryOnly skips bullion, and the socket call uses the
+//   latest currentOfferUsd. The only edge case is if the bullion lastPrice
+//   entry was just cleared — but bullion lastPrice is never cleared by POST
+//   /rates (only jewellery entries are deleted), so there is no conflict.
 // ============================================================
 function repriceAll(options = {}) {
   if (!catalogReady || variantCache.size === 0) {
@@ -484,7 +530,10 @@ function repriceAll(options = {}) {
 
   const parts = [`${updateCount}/${variantCache.size} variants queued`];
   if (skipCount > 0) parts.push(`${skipCount} bullion skipped (no socket price yet)`);
-  if (updateCount === 0 && skipCount === 0) parts.length = 0, parts.push(`no change (< ${CONFIG.updateThresholdPct}% threshold)`);
+  if (updateCount === 0 && skipCount === 0) {
+    parts.length = 0;
+    parts.push(`no change (< ${CONFIG.updateThresholdPct}% threshold)`);
+  }
 
   const label = jewelleryOnly ? '💰 DJG rate change' : '📈 Market tick';
   console.log(`[PriceUpdater] ${label} → ${parts.join(' | ')}`);
@@ -560,10 +609,11 @@ function connectSocket() {
 //   GET  /health    — Railway health check + full status JSON
 //   POST /refresh   — Force catalog reload (Shopify product webhooks)
 //   GET  /rates     — Read current DJG retail rates
-//                     ⚠️  gold-rate.js should call this at startup to stay in sync
+//                     gold-rate.js calls this at startup to stay in sync
 //   POST /rates     — Update DJG rates from admin platform
 //                     Triggers immediate reprice of ALL jewellery variants.
 //                     Does NOT affect bullion (bullion price is socket-driven).
+//   GET  /debug     — Raw metafield inspection (use when catalog shows 0 products)
 //
 // Shopify webhooks (Admin → Settings → Notifications):
 //   Product creation → POST https://your-url.railway.app/refresh
@@ -573,20 +623,22 @@ function connectSocket() {
 //   Authorization: Bearer <ADMIN_SECRET>
 //   { "rates": { "24K": 582.25, "22K": 539.00, "21K": 517.00, "18K": 443.00, "14K": 345.50 } }
 //
-// ── IMPORTANT: POST /rates and gold-rate.js ────────────────────
-// POST /rates updates DJG rates on this Railway server and
-// immediately reprices Shopify variants (for checkout accuracy).
-// However, gold-rate.js runs in the BROWSER with its own
-// hardcoded djgRetailRates. To keep the browser in sync:
-//   Option A (recommended): Have gold-rate.js call GET /rates
-//             at startup and overwrite its CONFIG.djgRetailRates.
-//   Option B: Re-upload gold-rate.js to Shopify Assets manually
-//             each time DJG publishes new rates.
+// Required Railway environment variables:
+//   SHOPIFY_STORE      — mystore.myshopify.com
+//   SHOPIFY_TOKEN      — shpat_…
+//   SOCKET_SERVER_URL  — wss://…
+//   SOCKET_SECRET_KEY  — …
+//   ADMIN_SECRET       — strong random string (protects POST /rates)
+//   ADMIN_ORIGIN       — https://your-admin.vercel.app (restricts CORS for POST /rates)
+//   PORT               — set automatically by Railway
+//   DJG_RETAIL_RATES   — optional JSON seed (see CONFIG above)
 // ============================================================
 function startWebhookServer() {
   const server = http.createServer(async (req, res) => {
 
-    res.setHeader('Access-Control-Allow-Origin', process.env.ADMIN_ORIGIN || '*');
+    // FIX: Use specific ADMIN_ORIGIN instead of wildcard '*' in production.
+    // Set ADMIN_ORIGIN in Railway env vars to your admin platform URL.
+    res.setHeader('Access-Control-Allow-Origin', CONFIG.adminOrigin);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
@@ -610,6 +662,7 @@ function startWebhookServer() {
         currentOfferUsd: currentOfferUsd,
         djgRetailRates: CONFIG.djgRetailRates,
         ratesUpdatedAt: CONFIG._ratesUpdatedAt || null,
+        nodeVersion: process.versions.node,
       }));
       return;
     }
@@ -755,7 +808,9 @@ function startWebhookServer() {
           CONFIG.djgRetailRates = { ...CONFIG.djgRetailRates, ...payload.rates };
           CONFIG._ratesUpdatedAt = new Date().toISOString();
 
-          // Clear lastPrice cache so all jewellery variants reprice against new rates
+          // Clear lastPrice cache for jewellery only — forces reprice against new rates.
+          // Bullion lastPrice is intentionally preserved; bullion prices are socket-driven
+          // and will reprice on the next market tick regardless.
           for (const [variantId, meta] of variantCache) {
             if (meta.goldType !== 'bullion') lastPrice.delete(variantId);
           }
@@ -798,6 +853,7 @@ function startWebhookServer() {
     console.log(`[Server] Read rates:   GET  /rates`);
     console.log(`[Server] Update rates: POST /rates  (Authorization: Bearer <ADMIN_SECRET>)`);
     console.log(`[Server] Debug:        GET  /debug  ← use if catalog shows 0 products`);
+    console.log(`[Server] CORS origin:  ${CONFIG.adminOrigin}`);
   });
 
   return server;
@@ -824,10 +880,12 @@ async function startPriceUpdater() {
   console.log(`║   Store: ${(CONFIG.shopifyStore || 'not set').padEnd(48)}║`);
   console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
+  console.log(`[Config] Node.js: ${process.versions.node}`);
   console.log(`[Config] DJG rates: 24K=${CONFIG.djgRetailRates['24K']} 22K=${CONFIG.djgRetailRates['22K']} 21K=${CONFIG.djgRetailRates['21K']} 18K=${CONFIG.djgRetailRates['18K']} 14K=${CONFIG.djgRetailRates['14K']}`);
   console.log(`[Config] Update threshold: ${CONFIG.updateThresholdPct}%`);
   console.log(`[Config] VAT rate: ${CONFIG.vatRate * 100}%`);
   console.log(`[Config] usdToAed: ${CONFIG.usdToAed}`);
+  console.log(`[Config] CORS origin: ${CONFIG.adminOrigin}`);
   console.log('');
 
   startWebhookServer();
