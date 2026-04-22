@@ -8,61 +8,57 @@
  *   1. Shopify checkout  — variant prices updated via REST API
  *   2. Browser storefront — gold-rate.js calls GET /price per card
  *
- * Because both consumers call the same calculateJewellery() /
- * calculateBullion() / calculateSilver() functions, the price
- * shown on the product page is always identical to the checkout price.
- *
- * ROUNDING POLICY:
- *   Every intermediate value is computed in full floating-point.
- *   Only the FINAL total returned to Shopify / to the browser is
- *   rounded to the nearest whole AED (Math.round).
- *   Sub-totals in GET /price responses (goldCost, making, vat …)
- *   are also rounded to whole AED for display consistency.
+ * BUGS FIXED vs previous version:
+ *   FIX 1 — Socket reconnect clears lastPrice for bullion/silver so
+ *            the first tick after a redeploy always pushes a fresh price.
+ *   FIX 2 — Silver tick now calls repriceAll({ silverOnly: true })
+ *            instead of repriceAll() — stops jewellery being hit on
+ *            every silver tick.
+ *   FIX 3 — Bullion/silver use updateThresholdPct: 0 (no skip).
+ *            Jewellery still uses 0.5% (DJG rates rarely change).
+ *   FIX 4 — POST /rates now validates no rate is suspiciously low
+ *            (< 10 AED/g) to prevent accidental corrupt values.
+ *   FIX 5 — fetchCatalog() now reads isSilver metafield and
+ *            silverGrams so silver variants are correctly cached
+ *            and repriced.
  *
  * TWO PRODUCT TYPES — formulas:
  *
  * JEWELLERY  (type = jewellery)
- *   rateKarat  = djgRetailRates[karat]              ← DJG retail lookup
+ *   rateKarat  = djgRetailRates[karat]
  *   goldCost   = goldGrams × rateKarat
  *   diamCost   = diamondCt × 18,000 (AED/ct)
- *   making     = goldCost × (makingPct / 100)       ← gold only (UAE standard)
- *                set makingOnTotal=1 to apply on gold+diamond+stone
- *   vatBase    = goldCost + making                   ← diamonds excluded by default
- *                set vatOnAll=1 to include diamond+stone in VAT base
- *   vat        = vatBase × vatRate                   ← 0 if vatExempt=1
+ *   making     = goldCost × (makingPct / 100)
+ *   vatBase    = goldCost + making
+ *   vat        = vatBase × vatRate  (0 if vatExempt)
  *   total      = goldCost + diamCost + stoneCost + making + vat
- *   → ALL values rounded to whole AED
  *
  * BULLION    (type = bullion)
- *   rate24kAed  = (USD/oz ÷ 31.1035) × usdToAed    ← live socket price
+ *   rate24kAed  = (USD/oz ÷ 31.1035) × usdToAed
  *   ratePerGram = rate24kAed × bullionPurity[purity]
  *   goldCost    = goldGrams × ratePerGram
- *   vat         = goldCost × vatRate                ← 0 if vatExempt=1
+ *   vat         = goldCost × vatRate  (0 if vatExempt)
  *   total       = goldCost + vat
- *   → ALL values rounded to whole AED
  *
  * SILVER     (type = silver)
  *   silverCost  = silverGrams × (USD/oz ÷ 31.1035) × usdToAed
- *   vat         = silverCost × vatRate              ← 0 if vatExempt=1
+ *   vat         = silverCost × vatRate  (0 if vatExempt)
  *   total       = silverCost + vat
- *   → ALL values rounded to whole AED
+ *
+ * → ALL final values rounded to nearest whole AED (Math.round)
  *
  * ENDPOINTS:
  *   GET  /health    — status + variant counts + current rates
  *   GET  /price     — calculate price for one product (browser use)
  *   GET  /rates     — read current DJG retail rates
  *   POST /rates     — update DJG rates + reprice Shopify variants immediately
- *   POST /refresh   — force catalog reload (Shopify product webhooks)
+ *   POST /refresh   — force catalog reload
  *   GET  /debug     — raw metafield dump (troubleshooting)
- *
- * REQUIREMENTS: Node.js >= 18 (native fetch).
- *   Set "engines": { "node": ">=18" } in package.json.
  * ============================================================
  */
 
 'use strict';
 
-// ── Node version guard ─────────────────────────────────────────────
 const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
 if (nodeMajor < 18) {
   console.error(
@@ -87,14 +83,10 @@ const CONFIG = {
   socketUrl: process.env.SOCKET_SERVER_URL,
   secretKey: process.env.SOCKET_SECRET_KEY,
 
-  // ── DJG Retail Rates (AED per gram) ──────────────────────────
-  // Seed values — updated at runtime via POST /rates.
-  // Pre-seed via env: DJG_RETAIL_RATES={"24K":582.25,"22K":539.00,...}
   djgRetailRates: process.env.DJG_RETAIL_RATES
     ? JSON.parse(process.env.DJG_RETAIL_RATES)
     : { '24K': 582.25, '22K': 539.00, '21K': 517.00, '18K': 443.00, '14K': 345.50 },
 
-  // ── Bullion purity map ────────────────────────────────────────
   bullionPurity: {
     '999.9': 0.9999, '0.9999': 0.9999,
     '999.0': 0.999, '0.999': 0.999,
@@ -103,26 +95,31 @@ const CONFIG = {
     '750.0': 0.750, '0.750': 0.750,
   },
 
-  // ── Formula constants ─────────────────────────────────────────
   troyOzToGram: 31.1035,
   usdToAed: 3.674,
-  diamondRate: 18000,   // AED per carat
-  vatRate: 0.05,    // UAE 5% | KSA: 0.15 | Qatar/Kuwait: 0
+  diamondRate: 18000,
+  vatRate: 0.05,
 
-  // ── Metafield keys ────────────────────────────────────────────
   metafieldNamespace: 'custom',
   metafieldKeys: {
     goldGrams: 'gold_grams',
+    silverGrams: 'silver_grams',   // FIX 5 — added
     diamondCt: 'diamond_ct',
     stoneCost: 'stone_cost_aed',
     makingPct: 'making_charges',
     karat: 'gold_karat',
     vatExempt: 'vat_exempt',
     isBullion: 'is_bullion',
+    isSilver: 'is_silver',      // FIX 5 — added
     purity: 'purity',
   },
 
-  updateThresholdPct: 0.5,           // skip Shopify update if price moved < 0.5%
+  // FIX 3 — separate thresholds per product type.
+  // Bullion/silver: 0% — always push on every tick (live spot price).
+  // Jewellery: 0.5% — DJG rates are admin-set, skip tiny float drift.
+  updateThresholdPctBullion: 0,
+  updateThresholdPctJewellery: 0.5,
+
   catalogRefreshMs: 24 * 60 * 60 * 1000,
   webhookPort: process.env.PORT || 3001,
   maxCallsPerSecond: 2,
@@ -132,7 +129,6 @@ const CONFIG = {
   adminOrigin: process.env.ADMIN_ORIGIN || '*',
 };
 
-// ── Warn on missing security env vars ─────────────────────────────
 if (!CONFIG.adminSecret) {
   console.warn('[Config] ⚠️  ADMIN_SECRET not set — POST /rates is unprotected.');
 }
@@ -141,32 +137,23 @@ if (CONFIG.adminOrigin === '*') {
 }
 
 // ── STATE ──────────────────────────────────────────────────────────
-let variantCache = new Map();  // variantId → metafield data
-let lastPrice = new Map();  // variantId → last pushed price
+let variantCache = new Map();
+let lastPrice = new Map();
 let catalogReady = false;
 let lastFetchTime = null;
 let closingPriceSaved = false;
-let currentBidUsd = null;       // latest USD/oz bid from socket
-let currentOfferUsd = null;       // latest USD/oz offer from socket
-let currentSilverUsd = null;       // latest silver USD/oz offer from socket
+let currentBidUsd = null;
+let currentOfferUsd = null;
+let currentSilverUsd = null;
 
 const SHOPIFY_BASE = `https://${CONFIG.shopifyStore}/admin/api/${CONFIG.shopifyVersion}`;
 
 
 // ============================================================
 // PRICE CALCULATIONS
-//
-// ROUNDING POLICY:
-//   All intermediate values stay as full floats.
-//   The final total — and every sub-total in the returned object —
-//   is rounded to the nearest whole AED with Math.round().
-//   This ensures the browser display and Shopify checkout are
-//   always identical integers with no floating-point drift.
 // ============================================================
 
-// ── Jewellery ─────────────────────────────────────────────────────
 function calculateJewellery(meta) {
-  // Karat rate — DJG retail lookup; derive non-table karats from 24K
   let rateKarat;
   if (CONFIG.djgRetailRates[meta.karat]) {
     rateKarat = CONFIG.djgRetailRates[meta.karat];
@@ -179,12 +166,9 @@ function calculateJewellery(meta) {
   const diamCost = (meta.diamondCt || 0) * CONFIG.diamondRate;
   const stoneCost = meta.stoneCost || 0;
 
-  // Making base: gold only (UAE standard) unless makingOnTotal is set
   const makingBase = meta.makingOnTotal ? (goldCost + diamCost + stoneCost) : goldCost;
   const making = makingBase * ((meta.makingPct || 12) / 100);
 
-  // VAT base: gold + making by default (diamonds excluded — UAE standard)
-  // unless vatOnAll is set
   const vatBase = meta.vatOnAll
     ? (goldCost + diamCost + stoneCost + making)
     : (goldCost + making);
@@ -198,12 +182,10 @@ function calculateJewellery(meta) {
     stoneCost: Math.round(stoneCost),
     making: Math.round(making),
     vat: Math.round(vat),
-    rateKarat: Math.round(rateKarat),   // whole AED/g for display
+    rateKarat: Math.round(rateKarat),
   };
 }
 
-// ── Bullion ───────────────────────────────────────────────────────
-// Returns null if live socket price not yet available (cold start).
 function calculateBullion(meta) {
   if (!currentOfferUsd) return null;
 
@@ -223,15 +205,13 @@ function calculateBullion(meta) {
     total: Math.round(total),
     goldCost: Math.round(goldCost),
     vat: Math.round(vat),
-    ratePerGram: Math.round(ratePerGram),  // whole AED/g for display
+    ratePerGram: Math.round(ratePerGram),
     rate24kAed: Math.round(rate24kAed),
     fineness,
-    rawUsdOz: Math.round(currentOfferUsd * 100) / 100,  // 2dp USD
+    rawUsdOz: Math.round(currentOfferUsd * 100) / 100,
   };
 }
 
-// ── Silver ────────────────────────────────────────────────────────
-// Returns null if live socket price not yet available.
 function calculateSilver(meta) {
   if (!currentSilverUsd) return null;
 
@@ -249,7 +229,6 @@ function calculateSilver(meta) {
   };
 }
 
-// ── Dispatcher for variant cache (Shopify reprice) ────────────────
 function calculatePrice(meta) {
   if (meta.goldType === 'bullion') return calculateBullion(meta);
   if (meta.goldType === 'silver') return calculateSilver(meta);
@@ -264,7 +243,7 @@ async function fetchCatalog() {
   console.log('[Catalog] 🔄 Building product catalog...');
 
   const newCache = new Map();
-  let totalProds = 0, totalVars = 0, bullionCount = 0;
+  let totalProds = 0, totalVars = 0, bullionCount = 0, silverCount = 0;
 
   try {
     let hasNextPage = true;
@@ -314,7 +293,6 @@ async function fetchCatalog() {
         break;
       }
 
-      // Debug log on first page
       if (!cursor && products.edges.length > 0) {
         const fp = products.edges[0].node;
         const rawMeta = (fp.metafields?.edges || []).map(e => e.node);
@@ -333,20 +311,30 @@ async function fetchCatalog() {
           meta[m.node.key] = m.node.value;
         }
 
+        // FIX 5 — detect silver products first, then bullion, then jewellery
+        const isSilver = meta[CONFIG.metafieldKeys.isSilver] === 'true';
+        const isBullion = meta[CONFIG.metafieldKeys.isBullion] === 'true';
+
+        // FIX 5 — silver products use silverGrams; gold products use goldGrams
         const goldGrams = parseFloat(meta[CONFIG.metafieldKeys.goldGrams] || 0);
-        if (!goldGrams) continue;
+        const silverGrams = parseFloat(meta[CONFIG.metafieldKeys.silverGrams] || 0);
+
+        // Skip products with no relevant weight
+        if (!goldGrams && !silverGrams) continue;
 
         totalProds++;
-        const isBullion = meta[CONFIG.metafieldKeys.isBullion] === 'true';
         if (isBullion) bullionCount++;
+        if (isSilver) silverCount++;
 
+        const goldType = isSilver ? 'silver' : isBullion ? 'bullion' : 'jewellery';
         const numericProductId = parseInt(product.id.split('/').pop());
 
         const variantMeta = {
           productTitle: product.title,
           productId: numericProductId,
+          goldType,
           goldGrams,
-          goldType: isBullion ? 'bullion' : 'jewellery',
+          silverGrams,   // FIX 5 — always carry both; calc functions use the right one
           diamondCt: parseFloat(meta[CONFIG.metafieldKeys.diamondCt] || 0),
           stoneCost: parseFloat(meta[CONFIG.metafieldKeys.stoneCost] || 0),
           makingPct: parseFloat(meta[CONFIG.metafieldKeys.makingPct] || 12),
@@ -372,7 +360,7 @@ async function fetchCatalog() {
     lastFetchTime = new Date();
 
     console.log(`[Catalog] ✅ ${totalProds} products → ${totalVars} variants`);
-    console.log(`[Catalog]    Jewellery: ${totalProds - bullionCount} | Bullion: ${bullionCount}`);
+    console.log(`[Catalog]    Jewellery: ${totalProds - bullionCount - silverCount} | Bullion: ${bullionCount} | Silver: ${silverCount}`);
     logCatalogSummary();
 
   } catch (err) {
@@ -384,13 +372,20 @@ function logCatalogSummary() {
   const byProduct = new Map();
   for (const [, v] of variantCache) {
     if (!byProduct.has(v.productTitle)) {
-      byProduct.set(v.productTitle, { count: 0, karat: v.karat, grams: v.goldGrams, type: v.goldType });
+      byProduct.set(v.productTitle, {
+        count: 0, karat: v.karat,
+        grams: v.goldType === 'silver' ? v.silverGrams : v.goldGrams,
+        type: v.goldType,
+      });
     }
     byProduct.get(v.productTitle).count++;
   }
-  console.log('[Catalog] 📋 Gold products:');
+  console.log('[Catalog] 📋 Products:');
   for (const [title, info] of byProduct) {
-    const label = info.type === 'bullion' ? `${info.grams}g bullion` : `${info.grams}g ${info.karat}`;
+    let label;
+    if (info.type === 'bullion') label = `${info.grams}g bullion`;
+    else if (info.type === 'silver') label = `${info.grams}g silver`;
+    else label = `${info.grams}g ${info.karat}`;
     console.log(`  • ${title} — ${label} (${info.count} variant${info.count !== 1 ? 's' : ''})`);
   }
   console.log(`[Catalog] 🕐 Last updated: ${lastFetchTime?.toLocaleTimeString()}`);
@@ -433,8 +428,6 @@ async function updateVariantPrice(variantId, newPrice, retries = 0) {
   }
 }
 
-
-// ── Rate-limited API queue ─────────────────────────────────────────
 const apiQueue = [];
 let processing = false;
 
@@ -458,6 +451,9 @@ async function processQueue() {
 
 // ============================================================
 // REPRICE ALL VARIANTS
+//
+// FIX 2 — options.silverOnly added so SILVER ticks don't reprice jewellery.
+// FIX 3 — threshold is 0 for bullion/silver, 0.5% for jewellery.
 // ============================================================
 function repriceAll(options = {}) {
   if (!catalogReady || variantCache.size === 0) {
@@ -466,19 +462,28 @@ function repriceAll(options = {}) {
   }
 
   const jewelleryOnly = options.jewelleryOnly === true;
+  const silverOnly = options.silverOnly === true;
   let updateCount = 0, skipCount = 0;
 
   for (const [variantId, meta] of variantCache) {
+    // FIX 2 — filter correctly per trigger type
     if (jewelleryOnly && meta.goldType !== 'jewellery') continue;
+    if (silverOnly && meta.goldType !== 'silver') continue;
 
     const result = calculatePrice(meta);
     if (result === null) { skipCount++; continue; }
 
-    const newPrice = result.total;  // already a whole AED integer
+    const newPrice = result.total;
     const last = lastPrice.get(variantId);
+
+    // FIX 3 — zero threshold for live-priced types; 0.5% for DJG-rate types
+    const threshold = meta.goldType === 'jewellery'
+      ? CONFIG.updateThresholdPctJewellery
+      : CONFIG.updateThresholdPctBullion;  // 0 for bullion and silver
+
     const changePct = last ? Math.abs((newPrice - last) / last) * 100 : 100;
 
-    if (changePct >= CONFIG.updateThresholdPct) {
+    if (changePct >= threshold) {
       lastPrice.set(variantId, newPrice);
       enqueue(variantId, newPrice);
       updateCount++;
@@ -487,9 +492,11 @@ function repriceAll(options = {}) {
 
   const parts = [`${updateCount}/${variantCache.size} variants queued`];
   if (skipCount > 0) parts.push(`${skipCount} skipped (no live price yet)`);
-  if (!updateCount && !skipCount) parts.splice(0, 1, `no change (< ${CONFIG.updateThresholdPct}% threshold)`);
+  if (!updateCount && !skipCount) parts.splice(0, 1, `no change (threshold)`);
 
-  const label = jewelleryOnly ? '💰 DJG rate change' : '📈 Market tick';
+  const label = jewelleryOnly ? '💰 DJG rate change'
+    : silverOnly ? '🥈 Silver tick'
+      : '📈 Market tick';
   console.log(`[PriceUpdater] ${label} → ${parts.join(' | ')}`);
 }
 
@@ -513,6 +520,20 @@ function connectSocket() {
   socket.on('connect', () => {
     console.log('[Socket] ✅ Connected');
     socket.emit('request-data', ['GOLD', 'SILVER']);
+
+    // FIX 1 — clear lastPrice for bullion/silver on every (re)connect so the
+    // first tick always pushes a fresh price regardless of threshold.
+    // Jewellery is NOT cleared — its price is DJG-rate driven, not socket driven.
+    let cleared = 0;
+    for (const [variantId, meta] of variantCache) {
+      if (meta.goldType === 'bullion' || meta.goldType === 'silver') {
+        lastPrice.delete(variantId);
+        cleared++;
+      }
+    }
+    if (cleared > 0) {
+      console.log(`[Socket] 🔄 Cleared lastPrice for ${cleared} bullion/silver variant(s) — fresh reprice on first tick`);
+    }
   });
 
   socket.on('market-data', (data) => {
@@ -524,7 +545,7 @@ function connectSocket() {
 
       if (data.marketStatus === 'TRADEABLE') {
         closingPriceSaved = false;
-        repriceAll();
+        repriceAll();   // reprices bullion + jewellery (jewellery only if threshold crossed)
 
       } else if (!closingPriceSaved) {
         closingPriceSaved = true;
@@ -535,8 +556,8 @@ function connectSocket() {
 
     if (symbol === 'SILVER') {
       currentSilverUsd = data.offer;
-      // Reprice silver variants on every tick (like bullion)
-      repriceAll();
+      // FIX 2 — silver tick only reprices silver variants
+      repriceAll({ silverOnly: true });
     }
   });
 
@@ -554,16 +575,6 @@ function connectSocket() {
 
 // ============================================================
 // HTTP SERVER
-//
-// Required Railway environment variables:
-//   SHOPIFY_STORE      mystore.myshopify.com
-//   SHOPIFY_TOKEN      shpat_…
-//   SOCKET_SERVER_URL  wss://…
-//   SOCKET_SECRET_KEY  …
-//   ADMIN_SECRET       strong random string (protects POST /rates)
-//   ADMIN_ORIGIN       https://your-admin.vercel.app
-//   PORT               set automatically by Railway
-//   DJG_RETAIL_RATES   optional JSON seed
 // ============================================================
 function startWebhookServer() {
   const server = http.createServer(async (req, res) => {
@@ -597,36 +608,10 @@ function startWebhookServer() {
       return;
     }
 
-    // ── GET /price — browser card price calculator ────────────
-    //
-    // Query params:
-    //   type        jewellery | bullion | silver
-    //
-    //   jewellery:
-    //     grams     gold weight
-    //     karat     22K | 21K | 18K | 14K | 24K
-    //     diamond   diamond carats (optional, default 0)
-    //     stone     stone cost AED (optional, default 0)
-    //     making    making % (optional, default 12)
-    //     vatExempt 1 | 0 (optional, default 0)
-    //     makingOnTotal  1 | 0 (optional, default 0)
-    //     vatOnAll       1 | 0 (optional, default 0)
-    //
-    //   bullion:
-    //     grams     gold weight
-    //     purity    999.9 | 999.0 | 995.0 | 916.0 | 750.0
-    //     vatExempt 1 | 0
-    //
-    //   silver:
-    //     grams     silver weight
-    //     vatExempt 1 | 0
-    //
-    // Response: JSON with total + sub-totals, all whole AED integers.
-    // ─────────────────────────────────────────────────────────
+    // ── GET /price ────────────────────────────────────────────
     if (url.pathname === '/price' && req.method === 'GET') {
       const p = url.searchParams;
       const type = (p.get('type') || 'jewellery').toLowerCase();
-
       let result;
 
       if (type === 'bullion') {
@@ -635,25 +620,19 @@ function startWebhookServer() {
           purity: p.get('purity') || '999.9',
           vatExempt: p.get('vatExempt') === '1',
         });
-        if (!result) {
-          // No live socket price yet — return 0 so card shows nothing rather than crashing
-          result = {
-            total: 0, goldCost: 0, vat: 0, ratePerGram: 0,
-            rate24kAed: 0, fineness: 0, rawUsdOz: 0
-          };
-        }
+        if (!result) result = {
+          total: 0, goldCost: 0, vat: 0, ratePerGram: 0,
+          rate24kAed: 0, fineness: 0, rawUsdOz: 0
+        };
 
       } else if (type === 'silver') {
         result = calculateSilver({
           silverGrams: parseFloat(p.get('grams') || 0),
           vatExempt: p.get('vatExempt') === '1',
         });
-        if (!result) {
-          result = { total: 0, silverCost: 0, vat: 0, ratePerGram: 0, rawUsdOz: 0 };
-        }
+        if (!result) result = { total: 0, silverCost: 0, vat: 0, ratePerGram: 0, rawUsdOz: 0 };
 
       } else {
-        // jewellery (default)
         result = calculateJewellery({
           goldGrams: parseFloat(p.get('grams') || 0),
           karat: p.get('karat') || '22K',
@@ -666,10 +645,7 @@ function startWebhookServer() {
         });
       }
 
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-store',
-      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(result));
       return;
     }
@@ -768,13 +744,21 @@ function startWebhookServer() {
               res.end(JSON.stringify({ error: `Invalid rate for ${k}` }));
               return;
             }
+            // FIX 4 — sanity check: no real karat rate should be below 10 AED/g
+            if (payload.rates[k] < 10) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                error: `Rate for ${k} is suspiciously low (${payload.rates[k]} AED/g). ` +
+                  `Minimum accepted is 10 AED/g. Did you accidentally send a wrong value?`
+              }));
+              return;
+            }
           }
 
           const old = { ...CONFIG.djgRetailRates };
           CONFIG.djgRetailRates = { ...CONFIG.djgRetailRates, ...payload.rates };
           CONFIG._ratesUpdatedAt = new Date().toISOString();
 
-          // Clear lastPrice for jewellery only (bullion/silver are socket-driven)
           for (const [variantId, meta] of variantCache) {
             if (meta.goldType === 'jewellery') lastPrice.delete(variantId);
           }
@@ -811,7 +795,7 @@ function startWebhookServer() {
   server.listen(CONFIG.webhookPort, () => {
     console.log(`[Server] 🌐 Port ${CONFIG.webhookPort}`);
     console.log(`[Server] GET  /health   — status`);
-    console.log(`[Server] GET  /price    — browser card price (single source of truth)`);
+    console.log(`[Server] GET  /price    — browser card price`);
     console.log(`[Server] GET  /rates    — read DJG rates`);
     console.log(`[Server] POST /rates    — update DJG rates + reprice Shopify`);
     console.log(`[Server] POST /refresh  — reload catalog`);
@@ -844,7 +828,7 @@ async function startPriceUpdater() {
   console.log('');
   console.log(`[Config] Node.js: ${process.versions.node}`);
   console.log(`[Config] DJG rates: 24K=${CONFIG.djgRetailRates['24K']} 22K=${CONFIG.djgRetailRates['22K']} 21K=${CONFIG.djgRetailRates['21K']} 18K=${CONFIG.djgRetailRates['18K']} 14K=${CONFIG.djgRetailRates['14K']}`);
-  console.log(`[Config] VAT rate: ${CONFIG.vatRate * 100}%  |  usdToAed: ${CONFIG.usdToAed}  |  threshold: ${CONFIG.updateThresholdPct}%`);
+  console.log(`[Config] VAT rate: ${CONFIG.vatRate * 100}%  |  usdToAed: ${CONFIG.usdToAed}  |  bullion threshold: ${CONFIG.updateThresholdPctBullion}%  |  jewellery threshold: ${CONFIG.updateThresholdPctJewellery}%`);
   console.log(`[Config] CORS origin: ${CONFIG.adminOrigin}`);
   console.log('');
 
