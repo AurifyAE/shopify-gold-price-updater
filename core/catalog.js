@@ -271,7 +271,10 @@ function createCatalog(storeConfig) {
         if (hasNextPage) await sleep(200); // gentle pagination
       }
 
-      variantCache = newCache;
+      variantCache.clear();
+      for (const [variantId, meta] of newCache) {
+        variantCache.set(variantId, meta);
+      }
       _ready       = true;
       _lastFetch   = new Date();
 
