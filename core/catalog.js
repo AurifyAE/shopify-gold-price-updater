@@ -315,7 +315,7 @@ function createCatalog(storeConfig) {
         : `${info.grams}g ${info.karat}`;
       console.log(`${LOG}   • ${title} — ${label} (${info.count} variant${info.count !== 1 ? 's' : ''})`);
     }
-    console.log(`${LOG} 🕐 Last updated: ${_lastFetch?.toLocaleTimeString()}`);
+    console.log(`${LOG} 🕐 Last updated: ${_lastFetch?.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
   }
 
 
@@ -341,7 +341,8 @@ function createCatalog(storeConfig) {
         jewellery:  variants.filter(v => v.goldType === 'jewellery').length,
         bullion:    variants.filter(v => v.goldType === 'bullion').length,
         silver:     variants.filter(v => v.goldType === 'silver').length,
-        lastFetch:  _lastFetch?.toISOString() || null,
+        // lastFetch:  _lastFetch?.toISOString() || null,
+        lastFetch:  _lastFetch?.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) || null,
         ready:      _ready,
       };
     },
